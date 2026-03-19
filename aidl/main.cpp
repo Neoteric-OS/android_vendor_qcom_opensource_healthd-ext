@@ -6,21 +6,22 @@
 #define LOG_TAG "android.hardware.health-service.qti"
 
 #include <android-base/logging.h>
+#include <android-base/strings.h>
 #include <android/binder_interface_utils.h>
 #include <cutils/klog.h>
 #include <cutils/properties.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <health/utils.h>
 #include <health-impl/ChargerUtils.h>
 #include <health-impl/Health.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(x)     (sizeof(x) / sizeof((x)[0]))
-
-extern "C" {
-#include <libsoc_helper.h>
-}
 
 typedef enum soc_id {
         MSM_NEO_LA = 554,
@@ -41,6 +42,42 @@ static const enum soc_id target_no_psy[] = {
         MSM_ALISO_SSG,
         MSM_ALISO_SSG2,
 };
+
+static int read_soc_id() {
+    constexpr const char* kSocIdPaths[] = {
+        "/sys/devices/soc0/soc_id",
+        "/sys/devices/system/soc/soc0/id",
+    };
+    char buf[PROPERTY_VALUE_MAX];
+
+    for (const auto* path : kSocIdPaths) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+
+        ssize_t len = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (len <= 0) {
+            continue;
+        }
+
+        buf[len] = '\0';
+        auto soc_id_str = android::base::Trim(buf);
+        if (soc_id_str.empty()) {
+            continue;
+        }
+
+        errno = 0;
+        char* end = nullptr;
+        long val = strtol(soc_id_str.c_str(), &end, 10);
+        if (errno == 0 && end != soc_id_str.c_str() && *end == '\0' && val >= 0 && val <= INT_MAX) {
+            return static_cast<int>(val);
+        }
+    }
+
+    return -1;
+}
 
 using aidl::android::hardware::health::HalHealthLoop;
 using aidl::android::hardware::health::Health;
@@ -73,26 +110,24 @@ void qti_healthd_board_init(struct healthd_config *hc)
     unsigned char retries = RETRY_COUNT;
     int ret = 0;
     unsigned char buf;
-    struct stat st;
-    char prop_str[PROPERTY_VALUE_MAX];
     int soc_id_prop = 0;
     bool is_no_batt_psy;
-    soc_info_v0_1_t soc;
 
     hc->ignorePowerSupplyNames.push_back(android::String8(ucsiPSYName[0]));
     hc->ignorePowerSupplyNames.push_back(android::String8(ucsiPSYName[1]));
 
     is_no_batt_psy = property_get_bool("persist.vendor.hal_health.no_batt_psy", false);
-
-    get_soc_info(&soc);
-    soc_id_prop = soc.msm_cpu;
+    soc_id_prop = read_soc_id();
 
     if (!is_no_batt_psy) {
         for (int idx = 0; idx < ARRAY_SIZE(target_no_psy); idx++) {
-             if(soc_id_prop == target_no_psy[idx]) {
+             if (soc_id_prop == target_no_psy[idx]) {
                 KLOG_INFO(LOG_TAG, "no support for batt_psy with socid:%d \n",soc_id_prop);
                 return;
            }
+        }
+        if (soc_id_prop < 0) {
+            KLOG_INFO(LOG_TAG, "soc_id unavailable, continuing batt_psy wait path\n");
         }
     } else {
         KLOG_INFO(LOG_TAG, "no support for batt_psy\n");
